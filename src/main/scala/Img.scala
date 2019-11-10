@@ -4,6 +4,9 @@ import org.scalatest.FunSpec
 import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.functions._
 import org.apache.spark.ml.recommendation._
+import org.apache.spark.mllib.recommendation.{ALS => ALSM}
+import org.apache.spark.mllib.recommendation.Rating
+import org.apache.spark.rdd.RDD
 import org.apache.spark.sql._
 
 import scala.util.Random
@@ -21,16 +24,15 @@ class LastFMRead extends Settings {
   val rawArtistAlias: Dataset[String] = spark.read.textFile(artist_alias_path)
 
   def readUserArtist(): DataFrame = {
-    val userArtistDF = rawUserArtistData.map { line =>
+    rawUserArtistData.map { line =>
       val Array(user, artist, score) = line.split(' ')
       (user.toInt, artist.toInt)
     }.toDF("user", "artist")
 
-    userArtistDF
   }
 
   def readArtist(): DataFrame = {
-    val artistDF = rawArtistData.flatMap { line =>
+    rawArtistData.flatMap { line =>
       val (id, name) = line.span(_ != '\t')
       if (name.isEmpty) {
         None
@@ -42,12 +44,10 @@ class LastFMRead extends Settings {
         }
       }
     }.toDF("id", "name")
-
-    artistDF
   }
 
   def readArtistAlias(): DataFrame = {
-    val artistAliasDF = rawArtistAlias.flatMap { line =>
+    rawArtistAlias.flatMap { line =>
       val Array(artist, alias) = line.split('\t')
       if (artist.isEmpty) {
         None
@@ -55,8 +55,6 @@ class LastFMRead extends Settings {
         Some((artist.toInt, alias.toInt))
       }
     }.toDF("psue_id", "id")
-
-    artistAliasDF
   }
 
   def makeArtistById(): DataFrame = {
@@ -139,6 +137,15 @@ object Img extends FunSpec with Settings {
 
     val bArtistAlias = spark.sparkContext.broadcast(artistAlias)
 
+    val trainData_t = sc.textFile("hdfs:///Users/kenkuwata/workspace/kaggle/understanding_clouds/data/lastfm/user_artist_data.txt").map {line =>
+      val Array(userID, artistID, count) = line.split(' ').map(_.toInt)
+      val finalArtistID =
+        bArtistAlias.value.getOrElse(artistID, artistID)
+      Rating(userID, finalArtistID, count)
+    }.cache()
+
+    val model_t = ALSM.trainImplicit(trainData_t, 10, 5, 0.01, 1.0)
+
     val trainData = dataread.buildCounts(dataread.rawUserArtistData, bArtistAlias)
     trainData.cache()
 
@@ -161,10 +168,13 @@ object Img extends FunSpec with Settings {
 
     val userID = 2093760
 
-    val toRecommend = model.itemFactors.select($"id".as("artist")).withColumn("user", lit(userID))
-    toRecommend.cache()
+//    val toRecommend = model.
+//      itemFactors.
+//      select($"id".as("artist")).
+//      withColumn("user", lit(userID))
+//    toRecommend.cache()
 
-    model.transform(toRecommend).orderBy($"prediction".desc).limit(15).show()
+//    model.transform(toRecommend).orderBy($"prediction".desc).limit(15).show()
 
     val topRecommendations = dataread.makeRecommendations(model, userID, 10)
     val recommendedArtistIDS = topRecommendations.select("artist").as[Int].collect()
@@ -172,11 +182,13 @@ object Img extends FunSpec with Settings {
     val artistById = dataread.makeArtistById()
     artistById.filter($"id".isin(recommendedArtistIDS:_*)).show()
 
+
 //    artistDF.withColumn("")
 
 //   val transform = model.transform(trainData).toDF("user", "artist", "count", "prediction")
 //    transform.withColumn("user", lit(userID)).withColumn("count", lit(0)).orderBy($"prediction".desc).limit(15).show()
 //    transform.withColumn("user", lit(userID)).withColumn("artist", lit(2814)).show()
+
 
   }
 }
