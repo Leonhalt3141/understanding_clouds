@@ -1,3 +1,5 @@
+package risk
+
 import org.apache.spark.sql.SparkSession
 
 

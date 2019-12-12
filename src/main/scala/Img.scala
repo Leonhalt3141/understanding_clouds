@@ -1,4 +1,6 @@
 
+import scala.collection.Map
+import scala.collection.mutable.ArrayBuffer
 import org.apache.spark.broadcast.Broadcast
 import org.scalatest.FunSpec
 import org.apache.spark.sql.DataFrame
@@ -7,6 +9,7 @@ import org.apache.spark.ml.recommendation._
 import org.apache.spark.mllib.recommendation.{ALS => ALSM}
 import org.apache.spark.mllib.recommendation.Rating
 import org.apache.spark.rdd.RDD
+import org.apache.spark.rdd._
 import org.apache.spark.sql._
 
 import scala.util.Random
@@ -57,7 +60,7 @@ class LastFMRead extends Settings {
     }.toDF("psue_id", "id")
   }
 
-  def makeArtistById(): DataFrame = {
+  def makeArtistByIdDF(): DataFrame = {
     rawArtistData.flatMap{ line =>
       val (id, name) = line.span(_ != '\t')
       if (name.isEmpty) {
@@ -70,6 +73,33 @@ class LastFMRead extends Settings {
         }
       }
     }.toDF("id", "name")
+  }
+
+  def makeArtistById(data: RDD[String]): RDD[(Int, String)] = {
+    data.flatMap{ line =>
+      val (id, name) = line.span(_ != '\t')
+      if (name.isEmpty) {
+        None
+      }else {
+        try {
+          Some((id.toInt, name.trim))
+        } catch {
+          case _: NumberFormatException => None
+        }
+      }
+    }
+
+  }
+
+  def buildArtistAlias(rawArtistAlias: Dataset[String]): Map[Int,Int] = {
+    rawArtistAlias.flatMap { line =>
+      val Array(artist, alias) = line.split('\t')
+      if (artist.isEmpty) {
+        None
+      } else {
+        Some((artist.toInt, alias.toInt))
+      }
+    }.collect().toMap
   }
 
   def buildCounts (rawUserArtistData: Dataset[String], bArtistAlias: Broadcast[Map[Int, Int]]): DataFrame = {
@@ -86,6 +116,67 @@ class LastFMRead extends Settings {
     model.transform(toRecommend).select("artist", "prediction").
       orderBy($"prediction".desc).
       limit(howMany)
+  }
+
+  def areaUnderCurve(
+                    positiveData: DataFrame,
+                    bAllArtistIDs: Broadcast[Array[Int]],
+                    predictFunction: DataFrame => DataFrame): Double = {
+
+    val positivePredictions = predictFunction(positiveData.select("user", "artist")).
+      withColumnRenamed("prediction", "positivePrediction")
+
+    val negativeData = positiveData.select("user", "artist").as[(Int,Int)].
+      groupByKey { case (user, _) => user }.
+      flatMapGroups { case (userID, userIDAndPosArtistIDs) =>
+        val random = new Random()
+        val posItemIDSet = userIDAndPosArtistIDs.map { case (_, artist) => artist }.toSet
+        val negative = new ArrayBuffer[Int]()
+        val allArtistIDs = bAllArtistIDs.value
+        var i = 0
+        // Make at most one pass over all artists to avoid an infinite loop.
+        // Also stop when number of negative equals positive set size
+        while (i < allArtistIDs.length && negative.size < posItemIDSet.size) {
+          val artistID = allArtistIDs(random.nextInt(allArtistIDs.length))
+          // Only add new distinct IDs
+          if (!posItemIDSet.contains(artistID)) {
+            negative += artistID
+          }
+          i += 1
+        }
+        // Return the set with user ID added back
+        negative.map(artistID => (userID, artistID))
+      }.toDF("user", "artist")
+
+    // Make predictions on the rest:
+    val negativePredictions = predictFunction(negativeData).
+      withColumnRenamed("prediction", "negativePrediction")
+
+    // Join positive predictions to negative predictions by user, only.
+    // This will result in a row for every possible pairing of positive and negative
+    // predictions within each user.
+    val joinedPredictions = positivePredictions.join(negativePredictions, "user").
+      select("user", "positivePrediction", "negativePrediction").cache()
+
+    // Count the number of pairs per user
+    val allCounts = joinedPredictions.
+      groupBy("user").agg(count(lit("1")).as("total")).
+      select("user", "total")
+    // Count the number of correctly ordered pairs per user
+    val correctCounts = joinedPredictions.
+      filter($"positivePrediction" > $"negativePrediction").
+      groupBy("user").agg(count("user").as("correct")).
+      select("user", "correct")
+
+    // Combine these, compute their ratio, and average over all users
+    val meanAUC = allCounts.join(correctCounts, Seq("user"), "left_outer").
+      select($"user", (coalesce($"correct", lit(0)) / $"total").as("auc")).
+      agg(mean("auc")).
+      as[Double].first()
+
+    joinedPredictions.unpersist()
+
+    meanAUC
   }
 }
 
@@ -108,6 +199,7 @@ object Img extends FunSpec with Settings {
 //    val df_ = spark.read.format("image").option("dropInvalid", true).load("data/train/")
 //    df_.select("image.origin", "image.width", "image.height").show(truncate = false)
 
+
     val dataread = new LastFMRead()
 
     val userArtistDF = dataread.readUserArtist()
@@ -119,15 +211,6 @@ object Img extends FunSpec with Settings {
     artistDF.show(10)
     println(artistDF.count())
 
-    val artistAlias = dataread.rawArtistAlias.flatMap { line =>
-      val Array(artist, alias) = line.split('\t')
-      if (artist.isEmpty) {
-        None
-      } else {
-        Some((artist.toInt, alias.toInt))
-      }
-    }.collect().toMap
-
     val artistAliasDF = dataread.readArtistAlias()
 
     artistAliasDF.show(10)
@@ -135,19 +218,15 @@ object Img extends FunSpec with Settings {
 
     artistDF.filter($"id" isin(1208690, 1003926, 6803336, 1000010)).show()
 
-    val bArtistAlias = spark.sparkContext.broadcast(artistAlias)
 
-    val trainData_t = sc.textFile("hdfs:///Users/kenkuwata/workspace/kaggle/understanding_clouds/data/lastfm/user_artist_data.txt").map {line =>
-      val Array(userID, artistID, count) = line.split(' ').map(_.toInt)
-      val finalArtistID =
-        bArtistAlias.value.getOrElse(artistID, artistID)
-      Rating(userID, finalArtistID, count)
-    }.cache()
+    val bArtistAlias = spark.sparkContext.broadcast(dataread.buildArtistAlias(dataread.rawArtistAlias))
 
-    val model_t = ALSM.trainImplicit(trainData_t, 10, 5, 0.01, 1.0)
 
     val trainData = dataread.buildCounts(dataread.rawUserArtistData, bArtistAlias)
-    trainData.cache()
+//    trainData.cache()
+    trainData.unpersist()
+
+
 
     val model = new ALS().
       setSeed(Random.nextLong()).
@@ -168,27 +247,25 @@ object Img extends FunSpec with Settings {
 
     val userID = 2093760
 
-//    val toRecommend = model.
-//      itemFactors.
-//      select($"id".as("artist")).
-//      withColumn("user", lit(userID))
-//    toRecommend.cache()
-
-//    model.transform(toRecommend).orderBy($"prediction".desc).limit(15).show()
 
     val topRecommendations = dataread.makeRecommendations(model, userID, 10)
     val recommendedArtistIDS = topRecommendations.select("artist").as[Int].collect()
 
-    val artistById = dataread.makeArtistById()
-    artistById.filter($"id".isin(recommendedArtistIDS:_*)).show()
+    val artistByIdDF = dataread.makeArtistByIdDF()
+    artistByIdDF.filter($"id".isin(recommendedArtistIDS:_*)).show()
 
 
-//    artistDF.withColumn("")
+    val existingArtistIDs = trainData.
+      filter($"user" === userID).
+      select("artist").as[Int].collect()
 
-//   val transform = model.transform(trainData).toDF("user", "artist", "count", "prediction")
-//    transform.withColumn("user", lit(userID)).withColumn("count", lit(0)).orderBy($"prediction".desc).limit(15).show()
-//    transform.withColumn("user", lit(userID)).withColumn("artist", lit(2814)).show()
 
+    val recommendedArtistIDs = topRecommendations.select("artist").as[Int].collect()
+    artistByIdDF.join(spark.createDataset(recommendedArtistIDs).toDF("id"), "id").
+      select("name").show()
+
+    model.userFactors.unpersist()
+    model.itemFactors.unpersist()
 
   }
 }
