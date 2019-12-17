@@ -2,16 +2,15 @@
 package risk
 
 import java.io.File
+
+import scala.io.Source
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 
-import org.apache.spark
-
 import scala.collection.mutable.ArrayBuffer
 import org.apache.spark.mllib.stat.KernelDensity
-import org.apache.spark.sql.{Dataset, SparkSession}
-import org.apache.spark.sql.functions
+import org.apache.spark.sql.{DataFrame, Dataset, SparkSession, functions}
 import org.apache.spark.util.StatCounter
 import breeze.plot._
 import org.apache.commons.math3.distribution.ChiSquaredDistribution
@@ -23,7 +22,6 @@ import org.scalatest.FunSpec
 
 
 object Risk extends FunSpec with Settings {
-  import spark.implicits._
 
   def main(args: Array[String]): Unit = {
     val runRisk = new Risk(spark)
@@ -33,30 +31,85 @@ object Risk extends FunSpec with Settings {
     println(factorsReturns.length)
     println(factorsReturns(2).mkString)
 
+    println("Stock data count: ", runRisk.rawStockData.count())
+    println(runRisk.rawStockData.show(10))
+    println(runRisk.rawStockData.take(0).toString.split(',')(0).mkString)
+    println(runRisk.rawStockData.take(0).toString.split(',')(0) == "Date")
+    println("Factor data count", runRisk.rawFactorData.count())
+
+    val stockDF = runRisk.readStockData()
+    println(stockDF.show(10))
+
     runRisk.plotDistribution(factorsReturns.head)
     runRisk.plotDistribution(factorsReturns(1))
 
-    val numTrials = 1000000
-    val parallelism = 1000
+    val numTrials = 10000000
+    val parallelism = 10
     val baseSeed = 1001L
 
-//    val trials = runRisk.computeTrialReturns(stocksReturns, factorsReturns, baseSeed, numTrials,
-//      parallelism)
+    val trials = runRisk.computeTrialReturns(stocksReturns, factorsReturns, baseSeed, numTrials,
+      parallelism)
+    trials.cache()
+    val tbroadcast = spark.sparkContext.broadcast(trials)
+//    trials.unpersist()
+    println(trials)
+    tbroadcast.unpersist()
+    println(trials.count())
+
+    val valueAtRisk = runRisk.fivePercentVaR(trials)
+    val conditionalValueAtRisk = runRisk.fivePercentCVaR(trials)
+    println("VaR 5%: " + valueAtRisk)
+    println("CVaR 5%: " + conditionalValueAtRisk)
+
+    val varConfidenceInterval = runRisk.bootstrappedConfidenceInterval(trials,
+      runRisk.fivePercentVaR, 100, .05)
+    val cvarConfidenceInterval = runRisk.bootstrappedConfidenceInterval(trials,
+      runRisk.fivePercentCVaR, 100, .05)
+    println("VaR confidence interval: " + varConfidenceInterval)
+    println("CVaR confidence interval: " + cvarConfidenceInterval)
+//    println("Kupiec test p-value: " + runRisk.kupiecTestPValue(stocksReturns, valueAtRisk, 0.05))
+    runRisk.plotDistribution(trials)
   }
 }
 
 class Risk(private val spark: SparkSession) {
   import spark.implicits._
 
+  private val stock_dir = "data/risk/stocks/"
+  private val factor_dir = "data/risk/factors/"
+
+  val rawStockData: Dataset[String] = spark.read.textFile(stock_dir)
+  val rawFactorData: Dataset[String] = spark.read.textFile(factor_dir)
+
+  def readStockData(): DataFrame = {
+    val formatter = DateTimeFormatter.ofPattern("d-MMM-yy", Locale.ENGLISH)
+    rawStockData.flatMap {line =>
+      val Array(date, open, high, low, close, volume) = line.split(",")
+      try {
+        if (date matches "Date") {
+          None
+        } else {
+          Some((date, open.toDouble, high.toDouble,
+            low.toDouble, close.toDouble, volume.toInt))
+        }
+      } catch {
+        case _: NumberFormatException => None
+      }
+    }.toDF("date", "open", "high", "low", "close", "volume")
+  }
+
   def readGoogleHistory(file: File): Array[(LocalDate, Double)] = {
     val formatter = DateTimeFormatter.ofPattern("d-MMM-yy", Locale.ENGLISH)
-    val lines = scala.io.Source.fromFile(file).getLines().toSeq
-    lines.tail.map { line =>
+    val source = Source.fromFile(file)
+    val lines = source.getLines().toSeq
+    val results = lines.tail.map { line =>
       val cols = line.split(',')
-      val date = LocalDate.parse(cols(0).mkString, formatter)
+      val date = LocalDate.parse(cols(0), formatter)
       val value = cols(4).toDouble
       (date, value)
     }.reverse.toArray
+    source.close()
+    results
   }
 
   def trimToRegion(history: Array[(LocalDate, Double)], start: LocalDate, end: LocalDate)
@@ -144,7 +197,7 @@ class Risk(private val spark: SparkSession) {
 
   def featurize(factorReturns: Array[Double]): Array[Double] = {
     val squaredReturns = factorReturns.map(x => math.signum(x) * x * x)
-    val squareRootedReturns = factorReturns.map(x => math.signum(x) * math.signum(x) * math.sqrt(math.abs(x)))
+    val squareRootedReturns = factorReturns.map(x => math.signum(x) * math.sqrt(math.abs(x)))
     squaredReturns ++ squareRootedReturns ++ factorReturns
   }
 
@@ -153,6 +206,12 @@ class Risk(private val spark: SparkSession) {
     val regression = new OLSMultipleLinearRegression()
     regression.newSampleData(instrument, factorMatrix)
     regression
+  }
+
+  def computeFactorWeights(
+                            stocksReturns: Seq[Array[Double]],
+                            factorFeatures: Array[Array[Double]]): Array[Array[Double]] = {
+    stocksReturns.map(linearModel(_, factorFeatures)).map(_.estimateRegressionParameters()).toArray
   }
 
   def trialReturns(
@@ -179,7 +238,7 @@ class Risk(private val spark: SparkSession) {
     for (instrument <- instruments) {
       totalReturn += instrumentTrialReturn(instrument, trial)
     }
-    totalReturn / instruments.length
+    totalReturn / instruments.size
   }
 
   def instrumentTrialReturn(instrument: Array[Double], trial: Array[Double]): Double = {
@@ -245,25 +304,73 @@ class Risk(private val spark: SparkSession) {
     topLosses.agg("value" -> "agg").first()(0).asInstanceOf[Double]
   }
 
-//
-//  def computeTrialReturns(
-//                         stocksReturns: Seq[Array[Double]],
-//                         factorsReturns: Seq[Array[Double]],
-//                         baseSeed: Long,
-//                         numTrials: Int,
-//                         parallelism: Int
-//                         ): Dataset[Double] = {
-//    val factorMat = factorMatrix(factorsReturns)
-//    val factorCov = new Covariance(factorMat).getCovarianceMatrix().getData()
-//    val factorMeans = factorsReturns.map(factor => factor.sum / factor.length).toArray
-//    val factorFeatures = factorMat.map(featurize)
-//    val factorWeights = computeFactorWeigths(stocksReturns, factorFeatures)
-//
-//    val seeds = (baseSeed until baseSeed + parallelism)
-//    val seedDS = seeds.toDS().repartition(parallelism)
-//
-//    seedDS.flatMap(trialReturns(_, numTrials / parallelism, factorWeights, factorMeans, factorCov))
-//  }
+  def bootstrappedConfidenceInterval(
+                                    trials: Dataset[Double],
+                                    computeStatistic: Dataset[Double] => Double,
+                                    numResamples: Int,
+                                    probability: Double
+                                    ): (Double, Double) = {
+    val replacement = true
+    val stats = (0 until numResamples).map{ _ =>
+      val resample = trials.sample(replacement, 1.0)
+      computeStatistic(resample)
+    }.sorted
+    val lowerIndex = (numResamples * probability / 2 - 1).toInt
+    val upperIndex = math.ceil(numResamples * (1 - probability / 2)).toInt
+    (stats(lowerIndex), stats(upperIndex))
+  }
+
+  def countFailures(stocksReturns: Seq[Array[Double]], valueAtRisk: Double): Int = {
+    var failures = 0
+    for (i <- stocksReturns.head.indices) {
+      val loss = stocksReturns.map(_(i)).sum
+      if (loss < valueAtRisk) {
+        failures += 1
+      }
+    }
+    failures
+  }
+
+  def kupiecTestStatistic(total: Int, failures: Int, confidenceLevel: Double): Double = {
+    val failureRatio = failures.toDouble / total
+    val logNumer = (total - failures) * math.log1p(-confidenceLevel) * failures * math.log(confidenceLevel)
+
+    val logDenom = (total - failures) * math.log1p(-failureRatio) * failures * math.log(failureRatio)
+    -2 * (logNumer - logDenom)
+  }
+
+  def kupiecTestPValue(
+                      stocksReturns: Seq[Array[Double]],
+                      valueAtRisk: Double,
+                      confidenceLevel: Double
+                      ): Double = {
+    val failures = countFailures(stocksReturns, valueAtRisk)
+    val total = stocksReturns.head.length
+    val testStatistic = kupiecTestStatistic(total, failures, confidenceLevel)
+    1 - new ChiSquaredDistribution(1.0).cumulativeProbability(testStatistic)
+  }
+
+
+
+  def computeTrialReturns(
+                           stocksReturns: Seq[Array[Double]],
+                           factorsReturns: Seq[Array[Double]],
+                           baseSeed: Long,
+                           numTrials: Int,
+                           parallelism: Int): Dataset[Double] = {
+    val factorMat = factorMatrix(factorsReturns)
+    val factorCov = new Covariance(factorMat).getCovarianceMatrix.getData
+    val factorMeans = factorsReturns.map(factor => factor.sum / factor.length).toArray
+    val factorFeatures = factorMat.map(featurize)
+    val factorWeights = computeFactorWeights(stocksReturns, factorFeatures)
+
+    // Generate different seeds so that our simulations don't all end up with the same results
+    val seeds = baseSeed until baseSeed + parallelism
+    val seedDS = seeds.toDS().repartition(parallelism)
+
+    // Main computation: run simulations and compute aggregate return for each
+    seedDS.flatMap(trialReturns(_, numTrials / parallelism, factorWeights, factorMeans, factorCov))
+  }
 
 
 }
