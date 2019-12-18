@@ -7,6 +7,7 @@ import scala.io.Source
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+import java.sql.Date
 
 import scala.collection.mutable.ArrayBuffer
 import org.apache.spark.mllib.stat.KernelDensity
@@ -18,6 +19,7 @@ import org.apache.commons.math3.distribution.MultivariateNormalDistribution
 import org.apache.commons.math3.random.MersenneTwister
 import org.apache.commons.math3.stat.correlation.Covariance
 import org.apache.commons.math3.stat.regression.OLSMultipleLinearRegression
+import org.apache.spark.SparkException
 import org.scalatest.FunSpec
 
 
@@ -26,60 +28,87 @@ object Risk extends FunSpec with Settings {
   def main(args: Array[String]): Unit = {
     val runRisk = new Risk(spark)
 
-    val (stocksReturns, factorsReturns) = runRisk.readStocksAndFactors()
-    println(stocksReturns.head.mkString)
-    println(factorsReturns.length)
-    println(factorsReturns(2).mkString)
 
-    println("Stock data count: ", runRisk.rawStockData.count())
-    println(runRisk.rawStockData.show(10))
-    println(runRisk.rawStockData.take(0).toString.split(',')(0).mkString)
-    println(runRisk.rawStockData.take(0).toString.split(',')(0) == "Date")
-    println("Factor data count", runRisk.rawFactorData.count())
-
-    val stockDF = runRisk.readStockData()
+    val stockDF = runRisk.readStockData2DataFrame(runRisk.stock_dirpath)
     println(stockDF.show(10))
 
-    runRisk.plotDistribution(factorsReturns.head)
-    runRisk.plotDistribution(factorsReturns(1))
+    val stocksDir = new File(runRisk.factor_dirpath)
+    val files = stocksDir.listFiles()
+    println(files.take(10).mkString)
 
-    val numTrials = 10000000
-    val parallelism = 10
-    val baseSeed = 1001L
+    val factorDF = runRisk.readStockData2DataFrame(runRisk.factor_dirpath)
+    println(factorDF.show(10))
 
-    val trials = runRisk.computeTrialReturns(stocksReturns, factorsReturns, baseSeed, numTrials,
-      parallelism)
-    trials.cache()
-    val tbroadcast = spark.sparkContext.broadcast(trials)
-//    trials.unpersist()
-    println(trials)
-    tbroadcast.unpersist()
-    println(trials.count())
-
-    val valueAtRisk = runRisk.fivePercentVaR(trials)
-    val conditionalValueAtRisk = runRisk.fivePercentCVaR(trials)
-    println("VaR 5%: " + valueAtRisk)
-    println("CVaR 5%: " + conditionalValueAtRisk)
-
-    val varConfidenceInterval = runRisk.bootstrappedConfidenceInterval(trials,
-      runRisk.fivePercentVaR, 100, .05)
-    val cvarConfidenceInterval = runRisk.bootstrappedConfidenceInterval(trials,
-      runRisk.fivePercentCVaR, 100, .05)
-    println("VaR confidence interval: " + varConfidenceInterval)
-    println("CVaR confidence interval: " + cvarConfidenceInterval)
-//    println("Kupiec test p-value: " + runRisk.kupiecTestPValue(stocksReturns, valueAtRisk, 0.05))
-    runRisk.plotDistribution(trials)
+//    val (stocksReturns, factorsReturns) = runRisk.readStocksAndFactors()
+//    println(stocksReturns.head.mkString)
+//    println(factorsReturns.length)
+//    println(factorsReturns(2).mkString)
+//
+//    println("Stock data count: ", runRisk.rawStockData.count())
+//    println(runRisk.rawStockData.show(10))
+//    println(runRisk.rawStockData.take(0).toString.split(',')(0).mkString)
+//    println(runRisk.rawStockData.take(0).toString.split(',')(0) == "Date")
+//    println("Factor data count", runRisk.rawFactorData.count())
+//
+//    val stockDF = runRisk.readStockData()
+//    println(stockDF.show(10))
+//
+//    runRisk.plotDistribution(factorsReturns.head)
+//    runRisk.plotDistribution(factorsReturns(1))
+//
+//    val numTrials = 10000000
+//    val parallelism = 10
+//    val baseSeed = 1001L
+//
+//    val trials = runRisk.computeTrialReturns(stocksReturns, factorsReturns, baseSeed, numTrials,
+//      parallelism)
+//    trials.cache()
+//    val tbroadcast = spark.sparkContext.broadcast(trials)
+////    trials.unpersist()
+//    println(trials)
+//    tbroadcast.unpersist()
+//    println(trials.count())
+//
+//    val valueAtRisk = runRisk.fivePercentVaR(trials)
+//    val conditionalValueAtRisk = runRisk.fivePercentCVaR(trials)
+//    println("VaR 5%: " + valueAtRisk)
+//    println("CVaR 5%: " + conditionalValueAtRisk)
+//
+//    val varConfidenceInterval = runRisk.bootstrappedConfidenceInterval(trials,
+//      runRisk.fivePercentVaR, 100, .05)
+//    val cvarConfidenceInterval = runRisk.bootstrappedConfidenceInterval(trials,
+//      runRisk.fivePercentCVaR, 100, .05)
+//    println("VaR confidence interval: " + varConfidenceInterval)
+//    println("CVaR confidence interval: " + cvarConfidenceInterval)
+////    println("Kupiec test p-value: " + runRisk.kupiecTestPValue(stocksReturns, valueAtRisk, 0.05))
+//    runRisk.plotDistribution(trials)
   }
 }
 
 class Risk(private val spark: SparkSession) {
   import spark.implicits._
 
-  private val stock_dir = "data/risk/stocks/"
-  private val factor_dir = "data/risk/factors/"
+  private val stock_dirpath: String = "data/risk/stocks/"
+  private val factor_dirpath: String = "data/risk/factors/"
 
-  val rawStockData: Dataset[String] = spark.read.textFile(stock_dir)
-  val rawFactorData: Dataset[String] = spark.read.textFile(factor_dir)
+  val rawStockData: Dataset[String] = spark.read.textFile(stock_dirpath)
+  val rawFactorData: Dataset[String] = spark.read.textFile(factor_dirpath)
+
+  def readStockData2DataFrame(files_dir: String): DataFrame = {
+    val stocksDir = new File(files_dir)
+    val files = stocksDir.listFiles()
+    val allStocks = files.iterator.flatMap { file =>
+      try {
+        readGoogleStock(file)
+      } catch {
+        case e: Exception =>
+          println(file.toString, e)
+          None
+      }
+    }
+
+    allStocks.toSeq.flatten.toDF("date", "open", "high", "low", "close", "volume", "code")
+  }
 
   def readStockData(): DataFrame = {
     val formatter = DateTimeFormatter.ofPattern("d-MMM-yy", Locale.ENGLISH)
@@ -96,6 +125,26 @@ class Risk(private val spark: SparkSession) {
         case _: NumberFormatException => None
       }
     }.toDF("date", "open", "high", "low", "close", "volume")
+  }
+
+  def readGoogleStock(file: File):
+    Seq[Option[(Date, Double, Double, Double, Double, Double, String)]] = {
+    val formatter = DateTimeFormatter.ofPattern("d-MMM-yy", Locale.ENGLISH)
+    val source = Source.fromFile(file)
+    val lines = source.getLines().toSeq
+    val results = lines.tail.map { line =>
+      val cols = line.split(',')
+      val date = LocalDate.parse(cols(0), formatter)
+      val cdate: Date = Date.valueOf(date)
+      try {
+        Some((cdate, cols(1).toDouble, cols(2).toDouble, cols(3).toDouble,
+          cols(4).toDouble, cols(5).toDouble, file.toString.split('.')(0).split('\\').last))
+      } catch {
+        case _: NumberFormatException => None
+      }
+    }.reverse
+    source.close()
+    results
   }
 
   def readGoogleHistory(file: File): Array[(LocalDate, Double)] = {
